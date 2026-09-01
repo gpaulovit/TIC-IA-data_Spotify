@@ -1,0 +1,846 @@
+"""
+================================================================================
+HIT MAKER - PIPELINE DE ANÁLISE E PREDIÇÃO DE SUCESSO MUSICAL (SPOTIFY)
+================================================================================
+Dataset de referência: Spotify Global Music Dataset (2009-2025) - Kaggle
+https://www.kaggle.com/datasets/wardabilal/spotify-global-music-dataset-20092025
+
+Estrutura baseada nas Guiding Questions refinadas do projeto, organizada em
+4 frentes estratégicas:
+    1. Auditoria e Diagnóstico do Dataset
+    2. Anatomia e Fatores de Sucesso (EDA)
+    3. Modelagem Preditiva
+    4. Aplicação de Produto e Inteligência de Mercado
+
+>>> PONTOS DE ATENÇÃO (possíveis fontes de erro / decisões a validar) ficam
+    marcados com o prefixo "#  ATENÇÃO:" ao longo do código. São os pontos
+    que eu destacaria em vermelho: exigem confirmação sua antes de rodar
+    em produção (nomes de colunas reais, thresholds de negócio, etc.).
+================================================================================
+"""
+
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.metrics import (
+    classification_report, roc_auc_score, confusion_matrix,
+    RocCurveDisplay, precision_recall_curve
+)
+from sklearn.decomposition import PCA
+from sklearn.neighbors import NearestNeighbors
+
+warnings.filterwarnings("ignore")
+sns.set_style("whitegrid")
+RANDOM_STATE = 42
+
+#  ATENÇÃO: confira estes nomes contra o CSV real baixado do Kaggle.
+# Datasets do Spotify costumam variar (ex: 'track_genre' vs 'genre',
+# 'popularity' vs 'track_popularity'). Ajuste o dicionário abaixo em UM
+# lugar só, e o resto do script se adapta.
+COLUNAS = {
+    "genero": "track_genre",
+    "popularidade": "popularity",
+    "id_faixa": "track_id",
+    "nome_faixa": "track_name",
+    "artista": "artists",
+}
+
+FEATURES_NUMERICAS = [
+    "danceability", "energy", "valence", "tempo", "loudness",
+    "acousticness", "instrumentalness", "liveness", "speechiness",
+]
+
+
+# ================================================================================
+# FRENTE 1: AUDITORIA E DIAGNÓSTICO DO DATASET
+# ================================================================================
+
+def carregar_dataset(caminho_csv: str) -> pd.DataFrame:
+    """Carrega o dataset bruto do Kaggle."""
+    #  ATENÇÃO: ajuste o caminho/nome do arquivo baixado localmente.
+    df = pd.read_csv(caminho_csv)
+    return df
+
+
+def auditoria_dataset(df: pd.DataFrame) -> dict:
+    """
+    GQ: 'O dataset possui valores ausentes, duplicatas ou outliers críticos
+    nas variáveis principais que comprometam a confiabilidade da análise?'
+    """
+    relatorio = {}
+    relatorio["shape"] = df.shape
+    relatorio["n_generos"] = df[COLUNAS["genero"]].nunique()
+    relatorio["valores_ausentes"] = df.isnull().sum().sort_values(ascending=False)
+    relatorio["duplicatas"] = df.duplicated().sum()
+    #  ATENÇÃO: duplicidade "real" costuma ser por (artista + nome da faixa),
+    # não pela linha inteira — vale checar as duas formas.
+    relatorio["duplicatas_artista_faixa"] = df.duplicated(
+        subset=[COLUNAS["artista"], COLUNAS["nome_faixa"]]
+    ).sum()
+    relatorio["dtypes"] = df.dtypes
+    relatorio["describe"] = df[FEATURES_NUMERICAS + [COLUNAS["popularidade"]]].describe()
+    return relatorio
+
+
+def distribuicao_generos(df: pd.DataFrame):
+    """GQ: distribuição de faixas por gênero — equilibrada ou assimétrica?"""
+    freq = df[COLUNAS["genero"]].value_counts(normalize=True).sort_values(ascending=False)
+    plt.figure(figsize=(10, 8))
+    freq.head(30).plot(kind="barh")
+    plt.title("Distribuição relativa de faixas por gênero (top 30)")
+    plt.xlabel("Proporção do dataset")
+    plt.tight_layout()
+    return freq
+
+
+def detectar_outliers_iqr(df: pd.DataFrame, colunas: list) -> pd.DataFrame:
+    """Detecta outliers via IQR (1.5x) para as colunas numéricas informadas."""
+    contagem = {}
+    for col in colunas:
+        q1, q3 = df[col].quantile([0.25, 0.75])
+        iqr = q3 - q1
+        limite_inf, limite_sup = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        contagem[col] = ((df[col] < limite_inf) | (df[col] > limite_sup)).sum()
+    return pd.Series(contagem).sort_values(ascending=False)
+
+
+def tratar_valores_ausentes(df: pd.DataFrame, estrategia: str = "mediana") -> pd.DataFrame:
+    """
+    Aplica a estratégia de tratamento de nulos.
+    #  ATENÇÃO: decisão de negócio — imputar, remover ou preservar?
+    Documente a escolha e a justificativa junto com o time.
+    """
+    df = df.copy()
+    if estrategia == "mediana":
+        for col in FEATURES_NUMERICAS:
+            if col in df.columns:
+                df[col] = df[col].fillna(df[col].median())
+    elif estrategia == "remover":
+        df = df.dropna(subset=FEATURES_NUMERICAS)
+    return df
+
+
+# ================================================================================
+# FRENTE 2: ANATOMIA E FATORES DE SUCESSO (EDA)
+# ================================================================================
+
+def definir_hit(df: pd.DataFrame, percentil_corte: float = 80.0):
+    """
+    Cria o rótulo binário 'is_hit'.
+    #  ATENÇÃO: este threshold é a decisão mais crítica do projeto — define
+    # o que conta como "sucesso". Um percentil fixo global pode distorcer
+    # gêneros de nicho (que nunca atingem popularidade alta em termos
+    # absolutos). Considere threshold POR GÊNERO como alternativa (ver
+    # `definir_hit_por_genero` abaixo).
+    """
+    df = df.copy()
+    limiar = np.percentile(df[COLUNAS["popularidade"]], percentil_corte)
+    df["is_hit"] = (df[COLUNAS["popularidade"]] >= limiar).astype(int)
+    return df, limiar
+
+
+def definir_hit_por_genero(df: pd.DataFrame, percentil_corte: float = 80.0):
+    """Threshold relativo ao próprio gênero — evita viés contra nichos."""
+    df = df.copy()
+    limiares = df.groupby(COLUNAS["genero"])[COLUNAS["popularidade"]].transform(
+        lambda s: np.percentile(s, percentil_corte)
+    )
+    df["is_hit"] = (df[COLUNAS["popularidade"]] >= limiares).astype(int)
+    return df
+
+
+def comparar_hits_vs_demais(df: pd.DataFrame):
+    """
+    GQ: quais características diferenciam faixas de alta popularidade das demais?
+    """
+    comparacao = df.groupby("is_hit")[FEATURES_NUMERICAS].mean().T
+    comparacao.columns = ["Não-hit", "Hit"]
+    comparacao["diferenca_%"] = (
+        (comparacao["Hit"] - comparacao["Não-hit"]) / comparacao["Não-hit"] * 100
+    )
+    return comparacao.sort_values("diferenca_%", ascending=False)
+
+
+def densidade_e_volatilidade_por_genero(df: pd.DataFrame):
+    """
+    GQ: quais gêneros têm maior densidade de hits vs. volume de lançamentos,
+    e quais têm maior volatilidade de popularidade?
+    """
+    agrupado = df.groupby(COLUNAS["genero"]).agg(
+        n_faixas=(COLUNAS["popularidade"], "size"),
+        n_hits=("is_hit", "sum"),
+        popularidade_media=(COLUNAS["popularidade"], "mean"),
+        popularidade_desvio=(COLUNAS["popularidade"], "std"),
+    )
+    agrupado["densidade_de_hits"] = agrupado["n_hits"] / agrupado["n_faixas"]
+    return agrupado.sort_values("densidade_de_hits", ascending=False)
+
+
+# ================================================================================
+# FRENTE 3: MODELAGEM PREDITIVA
+# ================================================================================
+
+def preparar_features(df: pd.DataFrame, incluir_genero: bool = True):
+    """Monta a matriz de features (X) e o alvo (y) para o modelo."""
+    X = df[FEATURES_NUMERICAS].copy()
+    if incluir_genero:
+        #  ATENÇÃO: one-hot em gêneros com alta cardinalidade pode gerar
+        # muitas colunas esparsas. Avalie target/frequency encoding se
+        # o dataset tiver dezenas de gêneros.
+        genero_dummies = pd.get_dummies(df[COLUNAS["genero"]], prefix="genero")
+        X = pd.concat([X, genero_dummies], axis=1)
+    y = df["is_hit"]
+    return X, y
+
+
+def treinar_modelo(X: pd.DataFrame, y: pd.Series):
+    """
+    GQ: 'É possível treinar um modelo acurado para estimar a probabilidade
+    de uma faixa atingir alta popularidade?'
+    """
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=RANDOM_STATE
+    )
+
+    #  ATENÇÃO: o rótulo "hit" (top 20% por padrão) tende a gerar
+    # desbalanceamento de classes (~80/20). Usar class_weight='balanced'
+    # é o mínimo — considere também SMOTE se a performance for baixa.
+    modelo = RandomForestClassifier(
+        n_estimators=300,
+        class_weight="balanced",
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+    )
+    modelo.fit(X_train, y_train)
+    return modelo, X_train, X_test, y_train, y_test
+
+
+def avaliar_modelo(modelo, X_test, y_test):
+    y_pred = modelo.predict(X_test)
+    y_proba = modelo.predict_proba(X_test)[:, 1]
+
+    print(classification_report(y_test, y_pred))
+    print("ROC-AUC:", roc_auc_score(y_test, y_proba))
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    sns.heatmap(confusion_matrix(y_test, y_pred), annot=True, fmt="d",
+                cmap="Blues", ax=axes[0])
+    axes[0].set_title("Matriz de Confusão")
+    RocCurveDisplay.from_predictions(y_test, y_proba, ax=axes[1])
+    axes[1].set_title("Curva ROC")
+    plt.tight_layout()
+    return y_pred, y_proba
+
+
+def importancia_features(modelo, colunas_X):
+    """
+    GQ: 'Quais atributos exercem maior poder preditivo?'
+    """
+    importancias = pd.Series(
+        modelo.feature_importances_, index=colunas_X
+    ).sort_values(ascending=False)
+    plt.figure(figsize=(8, 6))
+    importancias.head(15).plot(kind="barh")
+    plt.gca().invert_yaxis()
+    plt.title("Top 15 features mais preditivas de sucesso")
+    plt.tight_layout()
+    return importancias
+
+
+# ================================================================================
+# FRENTE 4: APLICAÇÃO DE PRODUTO E INTELIGÊNCIA DE MERCADO
+# ================================================================================
+
+def criar_perfil_referencia(df: pd.DataFrame, genero: str) -> pd.Series:
+    """
+    GQ: 'É viável criar um perfil de referência por gênero que permita
+    comparar uma música específica com os hits da categoria?'
+    """
+    hits_do_genero = df[(df[COLUNAS["genero"]] == genero) & (df["is_hit"] == 1)]
+    #  ATENÇÃO: gêneros com poucos hits (amostra pequena) geram perfis
+    # instáveis. Defina um mínimo de faixas (ex: 30) antes de confiar no perfil.
+    if len(hits_do_genero) < 30:
+        warnings.warn(f"Gênero '{genero}' tem apenas {len(hits_do_genero)} hits "
+                       f"— perfil pode não ser estatisticamente robusto.")
+    return hits_do_genero[FEATURES_NUMERICAS].mean()
+
+
+def comparar_musica_com_perfil(musica: pd.Series, perfil_referencia: pd.Series) -> pd.DataFrame:
+    """
+    GQ: 'Identificar pontos de aproximação/diferença e recomendar melhorias.'
+    Retorna, feature a feature, a diferença percentual entre a faixa e o hit médio.
+    """
+    comparacao = pd.DataFrame({
+        "musica": musica[FEATURES_NUMERICAS],
+        "perfil_hit_genero": perfil_referencia,
+    })
+    comparacao["diferenca_%"] = (
+        (comparacao["musica"] - comparacao["perfil_hit_genero"])
+        / comparacao["perfil_hit_genero"] * 100
+    )
+    return comparacao.sort_values("diferenca_%", key=abs, ascending=False)
+
+
+def identificar_faixas_subestimadas(df: pd.DataFrame, modelo, X: pd.DataFrame,
+                                     percentil_popularidade_baixa: float = 30,
+                                     limiar_probabilidade_hit: float = 0.6):
+    """
+    GQ: 'O modelo consegue mapear faixas subestimadas (baixa popularidade
+    atual, mas alta similaridade estrutural aos hits)?'
+
+    Lógica: pega faixas com popularidade real baixa, mas que o modelo
+    classifica com alta probabilidade de ser hit — candidatas a
+    relançamento/investimento.
+    """
+    #  ATENÇÃO: aqui há um risco de vazamento de dados (data leakage) se X
+    # tiver sido usado no treino do mesmo `modelo` — sempre rode isso sobre
+    # dados fora do conjunto de treino, ou refaça o predict_proba em cima do
+    # dataset completo com um modelo já validado.
+    probas = modelo.predict_proba(X)[:, 1]
+    limiar_pop_baixa = np.percentile(df[COLUNAS["popularidade"]], percentil_popularidade_baixa)
+
+    df_resultado = df.copy()
+    df_resultado["probabilidade_hit"] = probas
+    candidatas = df_resultado[
+        (df_resultado[COLUNAS["popularidade"]] <= limiar_pop_baixa) &
+        (df_resultado["probabilidade_hit"] >= limiar_probabilidade_hit)
+    ].sort_values("probabilidade_hit", ascending=False)
+
+    return candidatas[[COLUNAS["nome_faixa"], COLUNAS["artista"], COLUNAS["genero"],
+                        COLUNAS["popularidade"], "probabilidade_hit"]]
+
+
+# ================================================================================
+# EXECUÇÃO PRINCIPAL (exemplo de pipeline ponta a ponta)
+# ================================================================================
+
+if __name__ == "__main__":
+    #  ATENÇÃO: ajuste o caminho para o CSV baixado do Kaggle.
+    CAMINHO_DATASET = "spotify_global_music_dataset.csv"
+
+    # --- Frente 1 ---
+    df_bruto = carregar_dataset(CAMINHO_DATASET)
+    relatorio_auditoria = auditoria_dataset(df_bruto)
+    print("Shape:", relatorio_auditoria["shape"])
+    print("Duplicatas (linha inteira):", relatorio_auditoria["duplicatas"])
+    print("Duplicatas (artista+faixa):", relatorio_auditoria["duplicatas_artista_faixa"])
+
+    df_limpo = tratar_valores_ausentes(df_bruto, estrategia="mediana")
+
+    # --- Frente 2 ---
+    df_limpo, limiar_hit = definir_hit(df_limpo, percentil_corte=80)
+    tabela_comparativa = comparar_hits_vs_demais(df_limpo)
+    print(tabela_comparativa)
+
+    ranking_generos = densidade_e_volatilidade_por_genero(df_limpo)
+    print(ranking_generos.head(10))
+
+    # --- Frente 3 ---
+    X, y = preparar_features(df_limpo)
+    modelo, X_train, X_test, y_train, y_test = treinar_modelo(X, y)
+    avaliar_modelo(modelo, X_test, y_test)
+    ranking_features = importancia_features(modelo, X.columns)
+
+    # --- Frente 4 ---
+    #  ATENÇÃO: troque "pop" pelo gênero real que quiser investigar.
+    perfil_pop = criar_perfil_referencia(df_limpo, genero="pop")
+    faixas_subestimadas = identificar_faixas_subestimadas(df_limpo, modelo, X)
+    print(faixas_subestimadas.head(20))
+
+    plt.show()"""
+================================================================================
+HIT MAKER - PIPELINE DE ANÁLISE E PREDIÇÃO DE SUCESSO MUSICAL (SPOTIFY)
+================================================================================
+
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.metrics import (
+    classification_report, roc_auc_score, confusion_matrix,
+    RocCurveDisplay, precision_recall_curve
+)
+from sklearn.decomposition import PCA
+from sklearn.neighbors import NearestNeighbors
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+
+warnings.filterwarnings("ignore")
+sns.set_style("whitegrid")
+RANDOM_STATE = 42
+
+#  ATENÇÃO: confira estes nomes contra o CSV real baixado do Kaggle.
+# Datasets do Spotify costumam variar (ex: 'track_genre' vs 'genre',
+# 'popularity' vs 'track_popularity'). Ajuste o dicionário abaixo em UM
+# lugar só, e o resto do script se adapta.
+COLUNAS = {
+    "genero": "track_genre",
+    "popularidade": "popularity",
+    "id_faixa": "track_id",
+    "nome_faixa": "track_name",
+    "artista": "artists",
+}
+
+FEATURES_NUMERICAS = [
+    "danceability", "energy", "valence", "tempo", "loudness",
+    "acousticness", "instrumentalness", "liveness", "speechiness",
+]
+
+
+# ================================================================================
+# FRENTE 1: AUDITORIA E DIAGNÓSTICO DO DATASET
+# ================================================================================
+
+def carregar_dataset(caminho_csv: str) -> pd.DataFrame:
+    """Carrega o dataset bruto do Kaggle."""
+    #  ATENÇÃO: ajuste o caminho/nome do arquivo baixado localmente.
+    df = pd.read_csv(caminho_csv)
+    return df
+
+
+def auditoria_dataset(df: pd.DataFrame) -> dict:
+    """
+    GQ: 'O dataset possui valores ausentes, duplicatas ou outliers críticos
+    nas variáveis principais que comprometam a confiabilidade da análise?'
+    """
+    relatorio = {}
+    relatorio["shape"] = df.shape
+    relatorio["n_generos"] = df[COLUNAS["genero"]].nunique()
+    relatorio["valores_ausentes"] = df.isnull().sum().sort_values(ascending=False)
+    relatorio["duplicatas"] = df.duplicated().sum()
+    #  ATENÇÃO: duplicidade "real" costuma ser por (artista + nome da faixa),
+    # não pela linha inteira — vale checar as duas formas.
+    relatorio["duplicatas_artista_faixa"] = df.duplicated(
+        subset=[COLUNAS["artista"], COLUNAS["nome_faixa"]]
+    ).sum()
+    relatorio["dtypes"] = df.dtypes
+    relatorio["describe"] = df[FEATURES_NUMERICAS + [COLUNAS["popularidade"]]].describe()
+    return relatorio
+
+
+def distribuicao_generos(df: pd.DataFrame):
+    """GQ: distribuição de faixas por gênero — equilibrada ou assimétrica?"""
+    freq = df[COLUNAS["genero"]].value_counts(normalize=True).sort_values(ascending=False)
+    plt.figure(figsize=(10, 8))
+    freq.head(30).plot(kind="barh")
+    plt.title("Distribuição relativa de faixas por gênero (top 30)")
+    plt.xlabel("Proporção do dataset")
+    plt.tight_layout()
+    return freq
+
+
+def detectar_outliers_iqr(df: pd.DataFrame, colunas: list) -> pd.DataFrame:
+    """Detecta outliers via IQR (1.5x) para as colunas numéricas informadas."""
+    contagem = {}
+    for col in colunas:
+        q1, q3 = df[col].quantile([0.25, 0.75])
+        iqr = q3 - q1
+        limite_inf, limite_sup = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        contagem[col] = ((df[col] < limite_inf) | (df[col] > limite_sup)).sum()
+    return pd.Series(contagem).sort_values(ascending=False)
+
+
+def tratar_valores_ausentes(df: pd.DataFrame, estrategia: str = "mediana") -> pd.DataFrame:
+    """
+    Aplica a estratégia de tratamento de nulos.
+    #  ATENÇÃO: decisão de negócio — imputar, remover ou preservar?
+    Documente a escolha e a justificativa junto com o time.
+    """
+    df = df.copy()
+    if estrategia == "mediana":
+        for col in FEATURES_NUMERICAS:
+            if col in df.columns:
+                df[col] = df[col].fillna(df[col].median())
+    elif estrategia == "remover":
+        df = df.dropna(subset=FEATURES_NUMERICAS)
+    return df
+
+
+# ================================================================================
+# FRENTE 2: ANATOMIA E FATORES DE SUCESSO (EDA)
+# ================================================================================
+
+def definir_hit(df: pd.DataFrame, percentil_corte: float = 80.0):
+    """
+    Cria o rótulo binário 'is_hit'.
+    #  ATENÇÃO: este threshold é a decisão mais crítica do projeto — define
+    # o que conta como "sucesso". Um percentil fixo global pode distorcer
+    # gêneros de nicho (que nunca atingem popularidade alta em termos
+    # absolutos). Considere threshold POR GÊNERO como alternativa (ver
+    # `definir_hit_por_genero` abaixo).
+    """
+    df = df.copy()
+    limiar = np.percentile(df[COLUNAS["popularidade"]], percentil_corte)
+    df["is_hit"] = (df[COLUNAS["popularidade"]] >= limiar).astype(int)
+    return df, limiar
+
+
+def definir_hit_por_genero(df: pd.DataFrame, percentil_corte: float = 80.0):
+    """Threshold relativo ao próprio gênero — evita viés contra nichos."""
+    df = df.copy()
+    limiares = df.groupby(COLUNAS["genero"])[COLUNAS["popularidade"]].transform(
+        lambda s: np.percentile(s, percentil_corte)
+    )
+    df["is_hit"] = (df[COLUNAS["popularidade"]] >= limiares).astype(int)
+    return df
+
+
+def comparar_hits_vs_demais(df: pd.DataFrame):
+    """
+    GQ: quais características diferenciam faixas de alta popularidade das demais?
+    """
+    comparacao = df.groupby("is_hit")[FEATURES_NUMERICAS].mean().T
+    comparacao.columns = ["Não-hit", "Hit"]
+    comparacao["diferenca_%"] = (
+        (comparacao["Hit"] - comparacao["Não-hit"]) / comparacao["Não-hit"] * 100
+    )
+    return comparacao.sort_values("diferenca_%", ascending=False)
+
+
+def densidade_e_volatilidade_por_genero(df: pd.DataFrame):
+    """
+    GQ: quais gêneros têm maior densidade de hits vs. volume de lançamentos,
+    e quais têm maior volatilidade de popularidade?
+    """
+    agrupado = df.groupby(COLUNAS["genero"]).agg(
+        n_faixas=(COLUNAS["popularidade"], "size"),
+        n_hits=("is_hit", "sum"),
+        popularidade_media=(COLUNAS["popularidade"], "mean"),
+        popularidade_desvio=(COLUNAS["popularidade"], "std"),
+    )
+    agrupado["densidade_de_hits"] = agrupado["n_hits"] / agrupado["n_faixas"]
+    return agrupado.sort_values("densidade_de_hits", ascending=False)
+
+
+# ================================================================================
+# FRENTE 3: MODELAGEM PREDITIVA
+# ================================================================================
+
+def preparar_features(df: pd.DataFrame, incluir_genero: bool = True):
+    """Monta a matriz de features (X) e o alvo (y) para o modelo."""
+    X = df[FEATURES_NUMERICAS].copy()
+    if incluir_genero:
+        # ⚠️ ATENÇÃO: one-hot em gêneros com alta cardinalidade pode gerar
+        # muitas colunas esparsas. Avalie target/frequency encoding se
+        # o dataset tiver dezenas de gêneros.
+        genero_dummies = pd.get_dummies(df[COLUNAS["genero"]], prefix="genero")
+        X = pd.concat([X, genero_dummies], axis=1)
+    y = df["is_hit"]
+    return X, y
+
+
+def treinar_modelo(X: pd.DataFrame, y: pd.Series):
+    """
+    GQ: 'É possível treinar um modelo acurado para estimar a probabilidade
+    de uma faixa atingir alta popularidade?'
+    """
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=RANDOM_STATE
+    )
+
+    #  ATENÇÃO: o rótulo "hit" (top 20% por padrão) tende a gerar
+    # desbalanceamento de classes (~80/20). Usar class_weight='balanced'
+    # é o mínimo — considere também SMOTE se a performance for baixa.
+    modelo = RandomForestClassifier(
+        n_estimators=300,
+        class_weight="balanced",
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+    )
+    modelo.fit(X_train, y_train)
+    return modelo, X_train, X_test, y_train, y_test
+
+
+def avaliar_modelo(modelo, X_test, y_test):
+    y_pred = modelo.predict(X_test)
+    y_proba = modelo.predict_proba(X_test)[:, 1]
+
+    print(classification_report(y_test, y_pred))
+    print("ROC-AUC:", roc_auc_score(y_test, y_proba))
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    sns.heatmap(confusion_matrix(y_test, y_pred), annot=True, fmt="d",
+                cmap="Blues", ax=axes[0])
+    axes[0].set_title("Matriz de Confusão")
+    RocCurveDisplay.from_predictions(y_test, y_proba, ax=axes[1])
+    axes[1].set_title("Curva ROC")
+    plt.tight_layout()
+    return y_pred, y_proba
+
+
+def importancia_features(modelo, colunas_X):
+    """
+    GQ: 'Quais atributos exercem maior poder preditivo?'
+    """
+    importancias = pd.Series(
+        modelo.feature_importances_, index=colunas_X
+    ).sort_values(ascending=False)
+    plt.figure(figsize=(8, 6))
+    importancias.head(15).plot(kind="barh")
+    plt.gca().invert_yaxis()
+    plt.title("Top 15 features mais preditivas de sucesso")
+    plt.tight_layout()
+    return importancias
+
+
+# ================================================================================
+# FRENTE 4: APLICAÇÃO DE PRODUTO E INTELIGÊNCIA DE MERCADO
+# ================================================================================
+
+def criar_perfil_referencia(df: pd.DataFrame, genero: str) -> pd.Series:
+    """
+    GQ: 'É viável criar um perfil de referência por gênero que permita
+    comparar uma música específica com os hits da categoria?'
+    """
+    hits_do_genero = df[(df[COLUNAS["genero"]] == genero) & (df["is_hit"] == 1)]
+    #  ATENÇÃO: gêneros com poucos hits (amostra pequena) geram perfis
+    # instáveis. Defina um mínimo de faixas (ex: 30) antes de confiar no perfil.
+    if len(hits_do_genero) < 30:
+        warnings.warn(f"Gênero '{genero}' tem apenas {len(hits_do_genero)} hits "
+                       f"— perfil pode não ser estatisticamente robusto.")
+    return hits_do_genero[FEATURES_NUMERICAS].mean()
+
+
+def comparar_musica_com_perfil(musica: pd.Series, perfil_referencia: pd.Series) -> pd.DataFrame:
+    """
+    GQ: 'Identificar pontos de aproximação/diferença e recomendar melhorias.'
+    Retorna, feature a feature, a diferença percentual entre a faixa e o hit médio.
+    """
+    comparacao = pd.DataFrame({
+        "musica": musica[FEATURES_NUMERICAS],
+        "perfil_hit_genero": perfil_referencia,
+    })
+    comparacao["diferenca_%"] = (
+        (comparacao["musica"] - comparacao["perfil_hit_genero"])
+        / comparacao["perfil_hit_genero"] * 100
+    )
+    return comparacao.sort_values("diferenca_%", key=abs, ascending=False)
+
+
+def identificar_faixas_subestimadas(df: pd.DataFrame, modelo, X: pd.DataFrame,
+                                     percentil_popularidade_baixa: float = 30,
+                                     limiar_probabilidade_hit: float = 0.6):
+    """
+    GQ: 'O modelo consegue mapear faixas subestimadas (baixa popularidade
+    atual, mas alta similaridade estrutural aos hits)?'
+
+    Lógica: pega faixas com popularidade real baixa, mas que o modelo
+    classifica com alta probabilidade de ser hit — candidatas a
+    relançamento/investimento.
+    """
+    #  ATENÇÃO: aqui há um risco de vazamento de dados (data leakage) se X
+    # tiver sido usado no treino do mesmo `modelo` — sempre rode isso sobre
+    # dados fora do conjunto de treino, ou refaça o predict_proba em cima do
+    # dataset completo com um modelo já validado.
+    probas = modelo.predict_proba(X)[:, 1]
+    limiar_pop_baixa = np.percentile(df[COLUNAS["popularidade"]], percentil_popularidade_baixa)
+
+    df_resultado = df.copy()
+    df_resultado["probabilidade_hit"] = probas
+    candidatas = df_resultado[
+        (df_resultado[COLUNAS["popularidade"]] <= limiar_pop_baixa) &
+        (df_resultado["probabilidade_hit"] >= limiar_probabilidade_hit)
+    ].sort_values("probabilidade_hit", ascending=False)
+
+    return candidatas[[COLUNAS["nome_faixa"], COLUNAS["artista"], COLUNAS["genero"],
+                        COLUNAS["popularidade"], "probabilidade_hit"]]
+
+
+# ================================================================================
+# FRENTE 4 (continuação): CLUSTERING E SIMILARIDADE ESTRUTURAL
+# ================================================================================
+# Complementa a modelagem preditiva: em vez de só prever "probabilidade de
+# hit", agrupa as faixas por perfil sonoro para responder diretamente
+# "quais músicas são estruturalmente parecidas com os hits?" — útil tanto
+# para achar faixas subestimadas quanto para o artista entender em qual
+# "arquétipo sonoro" a própria música se encaixa.
+
+def escalar_features(df: pd.DataFrame, colunas: list = None):
+    """
+    Padroniza as features numéricas (média 0, desvio 1).
+    #  ATENÇÃO: clustering e KNN são sensíveis a escala — nunca rode sobre
+    # os dados crus (ex: 'tempo' em BPM vs 'valence' entre 0-1 dominaria a
+    # distância euclidiana sem normalização).
+    """
+    colunas = colunas or FEATURES_NUMERICAS
+    scaler = StandardScaler()
+    X_escalado = scaler.fit_transform(df[colunas])
+    return pd.DataFrame(X_escalado, columns=colunas, index=df.index), scaler
+
+
+def encontrar_k_ideal(X_escalado: pd.DataFrame, k_min: int = 2, k_max: int = 12):
+    """
+    Testa vários valores de k e retorna inércia + silhouette score de cada um,
+    para apoiar a escolha do número de clusters (método do cotovelo).
+    #  ATENÇÃO: rodar por gênero costuma fazer mais sentido do que no
+    # dataset inteiro — "energy" e "tempo" médios variam muito entre gêneros,
+    # então clusters globais tendem a só reaprender o próprio gênero.
+    """
+    resultados = []
+    for k in range(k_min, k_max + 1):
+        km = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=10)
+        labels = km.fit_predict(X_escalado)
+        resultados.append({
+            "k": k,
+            "inercia": km.inertia_,
+            "silhouette": silhouette_score(X_escalado, labels),
+        })
+    resultado_df = pd.DataFrame(resultados)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].plot(resultado_df["k"], resultado_df["inercia"], marker="o")
+    axes[0].set_title("Método do cotovelo (inércia)")
+    axes[0].set_xlabel("k")
+    axes[1].plot(resultado_df["k"], resultado_df["silhouette"], marker="o", color="orange")
+    axes[1].set_title("Silhouette score")
+    axes[1].set_xlabel("k")
+    plt.tight_layout()
+    return resultado_df
+
+
+def clusterizar_faixas(df: pd.DataFrame, k: int, colunas: list = None):
+    """
+    Roda o KMeans final e devolve o df com a coluna 'cluster', além do
+    modelo e do scaler (necessários depois para posicionar novas faixas).
+    """
+    colunas = colunas or FEATURES_NUMERICAS
+    X_escalado, scaler = escalar_features(df, colunas)
+
+    modelo_kmeans = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=10)
+    df = df.copy()
+    df["cluster"] = modelo_kmeans.fit_predict(X_escalado)
+    return df, modelo_kmeans, scaler
+
+
+def perfil_dos_clusters(df: pd.DataFrame, colunas: list = None):
+    """
+    GQ: 'existe uma combinação de características associada às músicas de
+    alta popularidade?' — aqui respondida por cluster: cada grupo tem uma
+    "assinatura sonora" e uma taxa de hits associada.
+    """
+    colunas = colunas or FEATURES_NUMERICAS
+    perfil = df.groupby("cluster").agg(
+        n_faixas=("cluster", "size"),
+        taxa_de_hits=("is_hit", "mean"),
+        popularidade_media=(COLUNAS["popularidade"], "mean"),
+        **{f"{c}_medio": (c, "mean") for c in colunas},
+    ).sort_values("taxa_de_hits", ascending=False)
+    return perfil
+
+
+def visualizar_clusters_2d(df: pd.DataFrame, colunas: list = None):
+    """Projeta os clusters em 2D via PCA só para inspeção visual."""
+    colunas = colunas or FEATURES_NUMERICAS
+    X_escalado, _ = escalar_features(df, colunas)
+    coords = PCA(n_components=2, random_state=RANDOM_STATE).fit_transform(X_escalado)
+
+    plt.figure(figsize=(8, 6))
+    scatter = plt.scatter(coords[:, 0], coords[:, 1], c=df["cluster"],
+                           cmap="tab10", alpha=0.5, s=10)
+    plt.title("Clusters de faixas (projeção PCA 2D)")
+    plt.xlabel("Componente 1")
+    plt.ylabel("Componente 2")
+    plt.colorbar(scatter, label="Cluster")
+    plt.tight_layout()
+
+
+def musicas_similares_a_hits(df: pd.DataFrame, cluster_scaler, colunas: list = None,
+                              n_vizinhos: int = 5, genero: str = None):
+    """
+    GQ: 'mapear faixas subestimadas com alta similaridade estrutural aos
+    hits' — versão por DISTÂNCIA (KNN), complementar à versão por
+    probabilidade do modelo supervisionado.
+
+    Para cada faixa NÃO-hit, encontra os N hits mais próximos no espaço de
+    features e calcula a distância média — quanto menor, mais "parecida
+    com hit" a faixa é, mesmo tendo popularidade baixa hoje.
+    """
+    colunas = colunas or FEATURES_NUMERICAS
+    base = df if genero is None else df[df[COLUNAS["genero"]] == genero]
+
+    hits = base[base["is_hit"] == 1]
+    nao_hits = base[base["is_hit"] == 0]
+
+    #  ATENÇÃO: reaproveita o MESMO scaler ajustado nos hits para manter a
+    # mesma escala entre os dois grupos — nunca ajuste um scaler novo em
+    # cada subconjunto, ou a distância deixa de ser comparável.
+    X_hits = cluster_scaler.transform(hits[colunas])
+    X_nao_hits = cluster_scaler.transform(nao_hits[colunas])
+
+    knn = NearestNeighbors(n_neighbors=min(n_vizinhos, len(hits)))
+    knn.fit(X_hits)
+    distancias, _ = knn.kneighbors(X_nao_hits)
+
+    resultado = nao_hits.copy()
+    resultado["distancia_media_a_hits"] = distancias.mean(axis=1)
+    colunas_saida = [COLUNAS["nome_faixa"], COLUNAS["artista"], COLUNAS["genero"],
+                      COLUNAS["popularidade"], "distancia_media_a_hits"]
+    return resultado.sort_values("distancia_media_a_hits")[colunas_saida]
+
+
+# ================================================================================
+# EXECUÇÃO PRINCIPAL (exemplo de pipeline ponta a ponta)
+# ================================================================================
+
+if __name__ == "__main__":
+    #  ATENÇÃO: ajuste o caminho para o CSV baixado do Kaggle.
+    CAMINHO_DATASET = "spotify_global_music_dataset.csv"
+
+    # --- Frente 1 ---
+    df_bruto = carregar_dataset(CAMINHO_DATASET)
+    relatorio_auditoria = auditoria_dataset(df_bruto)
+    print("Shape:", relatorio_auditoria["shape"])
+    print("Duplicatas (linha inteira):", relatorio_auditoria["duplicatas"])
+    print("Duplicatas (artista+faixa):", relatorio_auditoria["duplicatas_artista_faixa"])
+
+    df_limpo = tratar_valores_ausentes(df_bruto, estrategia="mediana")
+
+    # --- Frente 2 ---
+    df_limpo, limiar_hit = definir_hit(df_limpo, percentil_corte=80)
+    tabela_comparativa = comparar_hits_vs_demais(df_limpo)
+    print(tabela_comparativa)
+
+    ranking_generos = densidade_e_volatilidade_por_genero(df_limpo)
+    print(ranking_generos.head(10))
+
+    # --- Frente 3 ---
+    X, y = preparar_features(df_limpo)
+    modelo, X_train, X_test, y_train, y_test = treinar_modelo(X, y)
+    avaliar_modelo(modelo, X_test, y_test)
+    ranking_features = importancia_features(modelo, X.columns)
+
+    # --- Frente 4 ---
+    #  ATENÇÃO: troque "pop" pelo gênero real que quiser investigar.
+    perfil_pop = criar_perfil_referencia(df_limpo, genero="pop")
+    faixas_subestimadas = identificar_faixas_subestimadas(df_limpo, modelo, X)
+    print(faixas_subestimadas.head(20))
+
+    # --- Frente 4 (clustering) ---
+    #  ATENÇÃO: rode encontrar_k_ideal() antes e escolha k olhando o
+    # gráfico de cotovelo/silhouette — 5 abaixo é só um valor de partida.
+    resultado_k = encontrar_k_ideal(escalar_features(df_limpo)[0], k_min=2, k_max=10)
+    print(resultado_k)
+
+    K_ESCOLHIDO = 5
+    df_clusterizado, modelo_kmeans, scaler_cluster = clusterizar_faixas(df_limpo, k=K_ESCOLHIDO)
+    print(perfil_dos_clusters(df_clusterizado))
+    visualizar_clusters_2d(df_clusterizado)
+
+    candidatas_por_similaridade = musicas_similares_a_hits(
+        df_clusterizado, scaler_cluster, genero="pop", n_vizinhos=5
+    )
+    print(candidatas_por_similaridade.head(20))
+
+    plt.show()
+
