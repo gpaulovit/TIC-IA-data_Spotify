@@ -1,0 +1,2 @@
+data_analysis/artifacts/*
+!data_analysis/artifacts/.gitkeep
