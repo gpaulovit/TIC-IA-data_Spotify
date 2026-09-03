@@ -1,18 +1,10 @@
-# Hit Maker — Music Intelligence
+## Interface do produto
 
-O Hit Maker é um protótipo de inteligência artificial desenvolvido para analisar características musicais, comparar faixas com padrões de hits e apoiar a identificação de oportunidades para artistas, produtores e profissionais de A&R.
+Acesse a demonstração funcional do Hit Maker:
 
-## Acesse o produto
+🎵 [Abrir o Hit Maker](https://hit-maker-intelligence.dida0982.chatgpt.site/)
 
-🎵 [Abrir a interface do Hit Maker](https://hit-maker-intelligence.dida0982.chatgpt.site/)
+A interface permite analisar características musicais, gerar um score demonstrativo, explicar o resultado e visualizar um ranking de oportunidades.
 
-## Principais funcionalidades
-
-- análise das características de uma música;
-- score demonstrativo de potencial;
-- comparação com o perfil de hits do gênero;
-- explicação dos fatores que influenciam o resultado;
-- ranking de faixas promissoras;
-- filtros de oportunidades por gênero.
-
-> O Hit Maker é um protótipo de apoio à decisão. O score representa similaridade com padrões históricos e não garante o sucesso comercial de uma música.
+- [Entenda como funciona cada parte da interface](./docs/interface.md)
+- [Acesse o código do frontend](./frontend)
